@@ -1,11 +1,15 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:nfc_manager/nfc_manager.dart';
 
 import '../main.dart' show apiBaseUrl;
+
+enum _AttendanceMode { manual, qr, nfc }
 
 class ManagerHome extends StatefulWidget {
   const ManagerHome({super.key, required this.profile, required this.token});
@@ -31,7 +35,15 @@ class _ManagerHomeState extends State<ManagerHome> {
   List<Map<String, dynamic>> _attendanceRecords = [];
   DateTime _historyDate = DateTime.now();
   bool _isLoadingHistory = false;
-  bool _isQrMode = false;
+  _AttendanceMode _attendanceMode = _AttendanceMode.manual;
+  bool _nfcAvailable = true;
+  bool _isNfcSessionActive = false;
+  bool _isNfcCheckoutPhase = false;
+  bool _isSubmittingNfc = false;
+  String? _nfcStatus;
+  Color? _nfcStatusColor;
+  String? _lastNfcUid;
+  DateTime? _lastNfcScanTime;
   String _employeeSearch = '';
   bool _isQrCheckoutPhase = false;
   bool _isSubmittingQr = false;
@@ -45,6 +57,7 @@ class _ManagerHomeState extends State<ManagerHome> {
   void initState() {
     super.initState();
     _updateManagerDeptFromProfile();
+    _checkNfcAvailability();
     _loadData();
   }
 
@@ -247,11 +260,11 @@ class _ManagerHomeState extends State<ManagerHome> {
       runSpacing: 8,
       children: [
         ElevatedButton.icon(
-          onPressed: () => setState(() {
-            _tabIndex = 2;
-            _isQrMode = true;
-            _qrStatus = null;
-          }),
+          onPressed: () {
+            setState(() => _tabIndex = 2);
+            _setAttendanceMode(_AttendanceMode.qr);
+            setState(() => _qrStatus = null);
+          },
           icon: const Icon(Icons.qr_code_scanner),
           label: const Text('Điểm danh nhanh'),
           style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12)),
@@ -338,6 +351,7 @@ class _ManagerHomeState extends State<ManagerHome> {
     final filteredEmployees = _employeeSearch.isEmpty
         ? employees
         : employees.where((e) => _matchesEmployeeSearch(e, _employeeSearch)).toList();
+    final mode = _attendanceMode;
     return RefreshIndicator(
       onRefresh: _loadData,
       child: ListView(
@@ -346,25 +360,34 @@ class _ManagerHomeState extends State<ManagerHome> {
         children: [
           const Text('Điểm danh', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 12),
-          Row(
-            children: [
-              const Text('Hình thức'),
-              const SizedBox(width: 12),
-              ChoiceChip(
-                label: const Text('Thủ công'),
-                selected: !_isQrMode,
-                onSelected: (_) => setState(() => _isQrMode = false),
-              ),
-              const SizedBox(width: 8),
-              ChoiceChip(
-                label: const Text('Quét QR'),
-                selected: _isQrMode,
-                onSelected: (_) => setState(() => _isQrMode = true),
-              ),
-            ],
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                const Text('Hình thức'),
+                const SizedBox(width: 12),
+                ChoiceChip(
+                  label: const Text('Thủ công'),
+                  selected: mode == _AttendanceMode.manual,
+                  onSelected: (_) => _setAttendanceMode(_AttendanceMode.manual),
+                ),
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: const Text('Quét QR'),
+                  selected: mode == _AttendanceMode.qr,
+                  onSelected: (_) => _setAttendanceMode(_AttendanceMode.qr),
+                ),
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: const Text('Quét NFC'),
+                  selected: mode == _AttendanceMode.nfc,
+                  onSelected: (_) => _setAttendanceMode(_AttendanceMode.nfc),
+                ),
+              ],
+            ),
           ),
           const SizedBox(height: 16),
-          if (!_isQrMode) ...[
+          if (mode == _AttendanceMode.manual) ...[
             TextField(
               decoration: const InputDecoration(
                 labelText: 'Tìm nhân viên (mã hoặc tên)',
@@ -422,7 +445,7 @@ class _ManagerHomeState extends State<ManagerHome> {
                 style: TextStyle(color: _attendanceStatusColor ?? Colors.green),
               ),
             ],
-          ] else ...[
+          ] else if (mode == _AttendanceMode.qr) ...[
             Row(
               children: [
                 const Text('Chế độ'),
@@ -449,7 +472,7 @@ class _ManagerHomeState extends State<ManagerHome> {
                   children: [
                     MobileScanner(
                       controller: _qrController,
-                      onDetect: _isQrMode ? _onQrDetect : null,
+                      onDetect: mode == _AttendanceMode.qr ? _onQrDetect : null,
                     ),
                     Positioned.fill(
                       child: DecoratedBox(
@@ -469,10 +492,312 @@ class _ManagerHomeState extends State<ManagerHome> {
                 _qrStatus!,
                 style: TextStyle(color: _qrStatusColor ?? Colors.green),
               ),
+          ] else ...[
+            Row(
+              children: [
+                const Text('Chế độ'),
+                const SizedBox(width: 12),
+                ChoiceChip(
+                  label: const Text('Check-in'),
+                  selected: !_isNfcCheckoutPhase,
+                  onSelected: (_) => setState(() => _isNfcCheckoutPhase = false),
+                ),
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: const Text('Check-out'),
+                  selected: _isNfcCheckoutPhase,
+                  onSelected: (_) => setState(() => _isNfcCheckoutPhase = true),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Icon(_nfcAvailable ? Icons.nfc : Icons.nfc_outlined,
+                    color: _nfcAvailable ? Colors.blueAccent : Colors.redAccent),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _nfcAvailable
+                        ? 'Chạm thẻ NFC vào mặt lưng thiết bị để điểm danh.'
+                        : 'NFC không khả dụng hoặc chưa bật.',
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton.icon(
+              onPressed: _isSubmittingNfc
+                  ? null
+                  : (_isNfcSessionActive ? _stopNfcSession : _startNfcSession),
+              icon: _isSubmittingNfc
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    )
+                  : Icon(_isNfcSessionActive ? Icons.stop_circle_outlined : Icons.play_arrow_rounded),
+              label: Text(_isNfcSessionActive ? 'Dừng quét NFC' : 'Bắt đầu quét NFC'),
+              style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+            ),
+            const SizedBox(height: 8),
+            if (_isNfcSessionActive)
+              const Text('Đang chờ thẻ NFC...', style: TextStyle(color: Colors.blueAccent)),
+            if (_nfcStatus != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                _nfcStatus!,
+                style: TextStyle(color: _nfcStatusColor ?? Colors.green),
+              ),
+            ],
           ],
         ],
       ),
     );
+  }
+
+  void _setAttendanceMode(_AttendanceMode mode) {
+    if (_attendanceMode == mode) return;
+    if (mode != _AttendanceMode.nfc) {
+      _stopNfcSession();
+    }
+    setState(() {
+      _attendanceMode = mode;
+      if (mode != _AttendanceMode.qr) {
+        _qrStatus = null;
+        _isQrCheckoutPhase = false;
+      }
+      if (mode != _AttendanceMode.nfc) {
+        _nfcStatus = null;
+        _isNfcCheckoutPhase = false;
+        _isSubmittingNfc = false;
+      }
+    });
+    if (mode == _AttendanceMode.nfc) {
+      _checkNfcAvailability();
+    }
+  }
+
+  Future<void> _checkNfcAvailability() async {
+    try {
+      final available = await NfcManager.instance.isAvailable();
+      if (mounted) {
+        setState(() {
+          _nfcAvailable = available;
+          if (!available) {
+            _nfcStatus = 'Thiết bị không hỗ trợ hoặc chưa bật NFC.';
+            _nfcStatusColor = Colors.redAccent;
+            _isNfcSessionActive = false;
+          }
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _nfcAvailable = false;
+          _nfcStatus = 'Không kiểm tra được NFC trên thiết bị.';
+          _nfcStatusColor = Colors.redAccent;
+          _isNfcSessionActive = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _startNfcSession() async {
+    if (_attendanceMode != _AttendanceMode.nfc) {
+      _setAttendanceMode(_AttendanceMode.nfc);
+    }
+    await _checkNfcAvailability();
+    if (!_nfcAvailable) return;
+
+    try {
+      await NfcManager.instance.stopSession();
+    } catch (_) {}
+
+    if (!mounted) return;
+    setState(() {
+      _isNfcSessionActive = true;
+      _nfcStatus = 'Đưa thẻ NFC gần thiết bị để điểm danh.';
+      _nfcStatusColor = Colors.blueAccent;
+    });
+
+    try {
+      await NfcManager.instance.startSession(
+        onDiscovered: _onNfcDiscovered,
+        pollingOptions: const {NfcPollingOption.iso14443, NfcPollingOption.iso18092},
+      );
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _nfcStatus = 'Không khởi động được NFC: $e';
+          _nfcStatusColor = Colors.redAccent;
+          _isNfcSessionActive = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _stopNfcSession() async {
+    try {
+      await NfcManager.instance.stopSession();
+    } catch (_) {}
+    if (mounted) {
+      setState(() => _isNfcSessionActive = false);
+    }
+  }
+
+  Future<void> _onNfcDiscovered(NfcTag tag) async {
+    final uid = _tagIdFromNfcTag(tag);
+    if (uid == null || uid.isEmpty) {
+      if (mounted) {
+        setState(() {
+          _nfcStatus = 'Không đọc được UID thẻ.';
+          _nfcStatusColor = Colors.redAccent;
+        });
+      }
+      return;
+    }
+
+    final now = DateTime.now();
+    if (_lastNfcUid == uid && _lastNfcScanTime != null && now.difference(_lastNfcScanTime!).inSeconds < 2) {
+      return;
+    }
+    _lastNfcUid = uid;
+    _lastNfcScanTime = now;
+    if (_isSubmittingNfc) return;
+
+    await _submitNfcAttendance(uid);
+  }
+
+  Future<void> _submitNfcAttendance(String uid) async {
+    final emp = _findEmployeeByNfcUid(uid);
+    if (emp == null) {
+      if (mounted) {
+        setState(() {
+          _nfcStatus = 'UID $uid không thuộc nhân viên bạn quản lý.';
+          _nfcStatusColor = Colors.redAccent;
+        });
+      }
+      return;
+    }
+
+    final empBizId = _extractEmployeeBusinessId(emp);
+    final empObjectId = _extractEmployeeId(emp);
+    final empCode = _extractEmployeeCode(emp);
+    final empName = emp['fullName']?.toString() ?? emp['name']?.toString() ?? empBizId;
+
+    if (mounted) {
+      setState(() {
+        _isSubmittingNfc = true;
+        _nfcStatus = 'Đang gửi điểm danh cho $empName...';
+        _nfcStatusColor = Colors.blueAccent;
+      });
+    }
+
+    try {
+      final endpoint = _isNfcCheckoutPhase ? 'check-out' : 'check-in';
+      final uri = Uri.parse('$apiBaseUrl/attendance/$endpoint');
+      final payload = {
+        'employeeId': empBizId.isNotEmpty ? empBizId : uid,
+        'method': 'nfc',
+        'nfcUid': uid,
+        if (empObjectId.isNotEmpty) 'employeeObjectId': empObjectId,
+        'managerId': _extractEmployeeId(widget.profile ?? {}),
+        if (empCode.isNotEmpty) 'employeeCode': empCode,
+        if (widget.profile?['code'] != null) 'managerCode': widget.profile?['code'],
+      };
+
+      final resp = await http.post(
+        uri,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${widget.token}',
+        },
+        body: jsonEncode(payload),
+      );
+
+      Map<String, dynamic>? body;
+      try {
+        final decoded = jsonDecode(resp.body);
+        if (decoded is Map<String, dynamic>) body = decoded;
+      } catch (_) {}
+
+      final success = (resp.statusCode == 200 || resp.statusCode == 201) &&
+          (body?['success'] == true || body?['status'] == 'success' || body == null);
+
+      if (success) {
+        if (mounted) {
+          setState(() {
+            _nfcStatus = _isNfcCheckoutPhase
+                ? 'Đã check-out cho $empName (UID $uid).'
+                : 'Đã check-in cho $empName (UID $uid).';
+            _nfcStatusColor = Colors.green;
+          });
+        }
+        await _loadAttendanceHistory();
+      } else {
+        final msg = body?['message']?.toString() ?? 'Điểm danh NFC thất bại';
+        if (mounted) {
+          setState(() {
+            _nfcStatus = msg;
+            _nfcStatusColor = Colors.redAccent;
+          });
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _nfcStatus = 'Lỗi điểm danh: $e';
+          _nfcStatusColor = Colors.redAccent;
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSubmittingNfc = false);
+      }
+    }
+  }
+
+  Map<String, dynamic>? _findEmployeeByNfcUid(String uid) {
+    final normalized = uid.toUpperCase();
+    for (final e in _employees) {
+      final raw = e['nfcUid'] ?? e['nfcID'] ?? e['nfcId'];
+      final value = raw?.toString();
+      if (value != null && value.isNotEmpty && value.toUpperCase() == normalized) {
+        return e;
+      }
+    }
+    return null;
+  }
+
+  String? _tagIdFromNfcTag(NfcTag tag) {
+    try {
+      final data = tag.data;
+      if (data is Map) {
+        final direct = data['identifier'];
+        if (direct is Uint8List && direct.isNotEmpty) {
+          return _bytesToHex(direct);
+        }
+
+        for (final value in data.values) {
+          if (value is Map) {
+            final id = value['identifier'];
+            if (id is Uint8List && id.isNotEmpty) {
+              return _bytesToHex(id);
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  String _bytesToHex(Uint8List bytes) {
+    final buffer = StringBuffer();
+    for (final b in bytes) {
+      buffer.write(b.toRadixString(16).padLeft(2, '0'));
+    }
+    return buffer.toString().toUpperCase();
   }
 
   Widget _buildAttendanceHistoryTab() {
@@ -1108,7 +1433,7 @@ class _ManagerHomeState extends State<ManagerHome> {
   }
 
   void _onQrDetect(BarcodeCapture capture) {
-    if (!_isQrMode) return;
+    if (_attendanceMode != _AttendanceMode.qr) return;
     if (capture.barcodes.isEmpty) return;
     final raw = capture.barcodes.first.rawValue ?? '';
     if (raw.isEmpty) return;
@@ -1540,6 +1865,9 @@ class _ManagerHomeState extends State<ManagerHome> {
   @override
   void dispose() {
     _qrController.dispose();
+    try {
+      NfcManager.instance.stopSession();
+    } catch (_) {}
     super.dispose();
   }
 }

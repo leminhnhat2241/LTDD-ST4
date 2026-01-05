@@ -8,10 +8,11 @@ import 'package:http/http.dart' as http;
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:nfc_manager/nfc_manager.dart';
 
 import '../main.dart' show apiBaseUrl;
 
-enum AttendanceMethod { qr }
+enum AttendanceMethod { qr, nfc }
 
 class DeviceHome extends StatefulWidget {
   const DeviceHome({super.key, required this.profile, required this.token});
@@ -24,6 +25,10 @@ class DeviceHome extends StatefulWidget {
 
 class _DeviceHomeState extends State<DeviceHome> {
   MobileScannerController? scannerController;
+
+  AttendanceMethod _method = AttendanceMethod.qr;
+  bool _nfcAvailable = false;
+  bool _nfcSessionActive = false;
 
   bool isCheckoutPhase = false; // false: check-in; true: check-out
   bool isProcessing = false;
@@ -118,6 +123,7 @@ class _DeviceHomeState extends State<DeviceHome> {
     super.initState();
     _initScanner();
     _initTts();
+    _checkNfcAvailability();
   }
 
   void _initScanner() {
@@ -133,8 +139,18 @@ class _DeviceHomeState extends State<DeviceHome> {
     _playerSuccess.dispose();
     _playerError.dispose();
     _tts.stop();
+    _stopNfcSession();
     scannerController?.dispose();
     super.dispose();
+  }
+
+  Future<void> _checkNfcAvailability() async {
+    try {
+      final available = await NfcManager.instance.isAvailable();
+      if (mounted) setState(() => _nfcAvailable = available);
+    } catch (_) {
+      if (mounted) setState(() => _nfcAvailable = false);
+    }
   }
 
   Future<void> _initTts() async {
@@ -170,6 +186,36 @@ class _DeviceHomeState extends State<DeviceHome> {
     await _sendAttendance(employeeId, method: method, photoBase64: null);
   }
 
+  String? _tagIdFromNfcTag(NfcTag tag) {
+    try {
+      final data = tag.data;
+      if (data is Map) {
+        final direct = data['identifier'];
+        if (direct is Uint8List && direct.isNotEmpty) {
+          return _bytesToHex(direct);
+        }
+
+        for (final value in data.values) {
+          if (value is Map) {
+            final id = value['identifier'];
+            if (id is Uint8List && id.isNotEmpty) {
+              return _bytesToHex(id);
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  String _bytesToHex(Uint8List bytes) {
+    final buffer = StringBuffer();
+    for (final b in bytes) {
+      buffer.write(b.toRadixString(16).padLeft(2, '0'));
+    }
+    return buffer.toString().toUpperCase();
+  }
+
   Future<void> _sendAttendance(
     String employeeId, {
     required String method,
@@ -180,10 +226,15 @@ class _DeviceHomeState extends State<DeviceHome> {
       final uri = Uri.parse('$apiBaseUrl/attendance/$endpoint');
 
       final payload = {
-        'employeeId': employeeId,
         'method': method,
         'deviceCode': widget.profile?['code'],
       };
+
+      if (method == 'nfc') {
+        payload['nfcUid'] = employeeId;
+      } else {
+        payload['employeeId'] = employeeId;
+      }
 
       if (photoBase64 != null) {
         payload['photoBase64'] = photoBase64;
@@ -275,6 +326,7 @@ class _DeviceHomeState extends State<DeviceHome> {
   }
 
   Future<void> _handleScan(String raw) async {
+    if (_method != AttendanceMethod.qr) return;
     if (isProcessing) return;
 
     setState(() {
@@ -311,12 +363,108 @@ class _DeviceHomeState extends State<DeviceHome> {
     }
   }
 
+  Future<void> _handleNfcTag(NfcTag tag) async {
+    if (_method != AttendanceMethod.nfc) return;
+    if (isProcessing) return;
+
+    final tagId = _tagIdFromNfcTag(tag);
+    if (tagId == null) {
+      if (!mounted) return;
+      setState(() {
+        statusMessage = 'Không đọc được mã thẻ. Thử lại.';
+      });
+      unawaited(_playError());
+      unawaited(_speak(statusMessage ?? ''));
+      await _restartNfcSession();
+      return;
+    }
+
+    setState(() {
+      isProcessing = true;
+      statusMessage = 'Đang xử lý thẻ NFC...';
+    });
+
+    try {
+      await _captureAndSend(tagId, method: 'nfc');
+    } finally {
+      isProcessing = false;
+      await _restartNfcSession();
+    }
+  }
+
+  Future<void> _startNfcSession() async {
+    if (_method != AttendanceMethod.nfc) return;
+
+    try {
+      final available = await NfcManager.instance.isAvailable();
+      if (!available) {
+        if (!mounted) return;
+        setState(() {
+          _nfcAvailable = false;
+          statusMessage = 'Thiết bị không hỗ trợ hoặc chưa bật NFC.';
+          _nfcSessionActive = false;
+        });
+        return;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _nfcAvailable = true;
+      });
+
+      if (_nfcSessionActive) return;
+
+      await NfcManager.instance.startSession(
+        onDiscovered: (tag) async {
+          await _handleNfcTag(tag);
+        },
+        pollingOptions: const {
+          NfcPollingOption.iso14443,
+          NfcPollingOption.iso15693,
+          NfcPollingOption.iso18092,
+        },
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _nfcSessionActive = true;
+        statusMessage ??= 'Đặt thẻ NFC gần thiết bị.';
+      });
+    } catch (e) {
+      debugPrint('Error starting NFC session: $e');
+      if (!mounted) return;
+      setState(() {
+        statusMessage = 'Không thể khởi động NFC: $e';
+        _nfcSessionActive = false;
+      });
+    }
+  }
+
+  Future<void> _stopNfcSession() async {
+    try {
+      await NfcManager.instance.stopSession();
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        _nfcSessionActive = false;
+      });
+    }
+  }
+
+  Future<void> _restartNfcSession() async {
+    await _stopNfcSession();
+    if (_method == AttendanceMethod.nfc && mounted) {
+      await Future.delayed(const Duration(milliseconds: 150));
+      await _startNfcSession();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Thiết bị - Điểm danh QR'),
+        title: const Text('Thiết bị - Điểm danh'),
         backgroundColor: Colors.deepPurple,
         foregroundColor: Colors.white,
         actions: [
@@ -331,6 +479,50 @@ class _DeviceHomeState extends State<DeviceHome> {
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
+            Row(
+              children: [
+                Text(
+                  'Phương thức',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: [
+                        ChoiceChip(
+                          label: const Text('QR'),
+                          selected: _method == AttendanceMethod.qr,
+                          onSelected: (v) {
+                            if (v) {
+                              setState(() => _method = AttendanceMethod.qr);
+                              scannerController?.start();
+                              _stopNfcSession();
+                            }
+                          },
+                        ),
+                        const SizedBox(width: 8),
+                        ChoiceChip(
+                          label: const Text('NFC'),
+                          selected: _method == AttendanceMethod.nfc,
+                          onSelected: (v) {
+                            if (v) {
+                              setState(() => _method = AttendanceMethod.nfc);
+                              scannerController?.stop();
+                              _startNfcSession();
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
             Row(
               children: [
                 Text(
@@ -368,26 +560,64 @@ class _DeviceHomeState extends State<DeviceHome> {
             ),
             const SizedBox(height: 12),
             const SizedBox(height: 12),
-            AspectRatio(
-              aspectRatio: 1,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: scannerController != null
-                    ? MobileScanner(
-                        controller: scannerController!,
-                        onDetect: (capture) {
-                          final barcodes = capture.barcodes;
-                          if (barcodes.isNotEmpty) {
-                            final raw = barcodes.first.rawValue;
-                            if (raw != null) {
-                              _handleScan(raw);
+            if (_method == AttendanceMethod.qr)
+              AspectRatio(
+                aspectRatio: 1,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: scannerController != null
+                      ? MobileScanner(
+                          controller: scannerController!,
+                          onDetect: (capture) {
+                            if (_method != AttendanceMethod.qr) return;
+                            final barcodes = capture.barcodes;
+                            if (barcodes.isNotEmpty) {
+                              final raw = barcodes.first.rawValue;
+                              if (raw != null) {
+                                _handleScan(raw);
+                              }
                             }
-                          }
-                        },
-                      )
-                    : const Center(child: CircularProgressIndicator()),
+                          },
+                        )
+                      : const Center(child: CircularProgressIndicator()),
+                ),
+              )
+            else
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceVariant,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.nfc,
+                      size: 96,
+                      color: _nfcAvailable
+                          ? theme.colorScheme.primary
+                          : theme.colorScheme.error,
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      !_nfcAvailable
+                          ? 'Thiết bị không hỗ trợ hoặc chưa bật NFC.'
+                          : _nfcSessionActive
+                              ? 'Giữ thẻ NFC gần thiết bị để điểm danh.'
+                              : 'Đang khởi động NFC, hãy bật NFC nếu chưa bật.',
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                    if (_nfcAvailable && !_nfcSessionActive)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 12),
+                        child: CircularProgressIndicator(),
+                      ),
+                  ],
+                ),
               ),
-            ),
             const SizedBox(height: 16),
             if (statusMessage != null)
               Container(

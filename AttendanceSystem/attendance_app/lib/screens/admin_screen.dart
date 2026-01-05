@@ -13,46 +13,47 @@ class AdminHome extends StatefulWidget {
   State<AdminHome> createState() => _AdminHomeState();
 }
 
-class _AdminHomeState extends State<AdminHome>
-    with SingleTickerProviderStateMixin {
-  late TabController _tabController;
+class _AdminHomeState extends State<AdminHome> {
+  int _navIndex = 0;
   List<Map<String, dynamic>> _employees = [];
   List<Map<String, dynamic>> _devices = [];
   List<Map<String, dynamic>> _departments = [];
   bool _isLoading = false;
+  String? _selectedAttendanceEmpId;
+  String? _selectedDeptFilter;
+  bool _isCheckoutPhase = false;
+  bool _isSubmittingAttendance = false;
+  String? _attendanceStatus;
+  Color? _attendanceStatusColor;
+  int _todayAttendanceCount = 0;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
     _loadData();
   }
 
   @override
   void dispose() {
-    _tabController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final titles = ['Admin Dashboard', 'Nhân viên', 'Thiết bị', 'Phòng ban', 'Điểm danh'];
+    final pages = [
+      _buildOverviewTab(),
+      _buildEmployeeTab(),
+      _buildDeviceTab(),
+      _buildDepartmentTab(),
+      _buildAttendanceTab(),
+    ];
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Admin Dashboard'),
+        title: Text(titles[_navIndex]),
         backgroundColor: Colors.blue[800],
         foregroundColor: Colors.white,
-        bottom: TabBar(
-          controller: _tabController,
-          labelColor: Colors.white,
-          unselectedLabelColor: Colors.white70,
-          indicatorColor: Colors.white,
-          tabs: const [
-            Tab(icon: Icon(Icons.dashboard), text: 'Tổng quan'),
-            Tab(icon: Icon(Icons.people), text: 'Nhân viên'),
-            Tab(icon: Icon(Icons.devices), text: 'Thiết bị'),
-            Tab(icon: Icon(Icons.business), text: 'Phòng ban'),
-          ],
-        ),
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
@@ -68,15 +69,18 @@ class _AdminHomeState extends State<AdminHome>
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
-          : TabBarView(
-              controller: _tabController,
-              children: [
-                _buildOverviewTab(),
-                _buildEmployeeTab(),
-                _buildDeviceTab(),
-                _buildDepartmentTab(),
-              ],
-            ),
+          : IndexedStack(index: _navIndex, children: pages),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _navIndex,
+        onDestinationSelected: (i) => setState(() => _navIndex = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard), label: 'Tổng quan'),
+          NavigationDestination(icon: Icon(Icons.people_outline), selectedIcon: Icon(Icons.people), label: 'Nhân viên'),
+          NavigationDestination(icon: Icon(Icons.devices_other_outlined), selectedIcon: Icon(Icons.devices), label: 'Thiết bị'),
+          NavigationDestination(icon: Icon(Icons.business_outlined), selectedIcon: Icon(Icons.business), label: 'Phòng ban'),
+          NavigationDestination(icon: Icon(Icons.how_to_reg_outlined), selectedIcon: Icon(Icons.how_to_reg), label: 'Điểm danh'),
+        ],
+      ),
     );
   }
 
@@ -87,6 +91,8 @@ class _AdminHomeState extends State<AdminHome>
       List<Map<String, dynamic>> employees = [];
       List<Map<String, dynamic>> devices = [];
       List<Map<String, dynamic>> departments = [];
+      int todayAttendanceCount = _todayAttendanceCount;
+      final todayStr = _formatDate(DateTime.now());
 
       // Load employees
       final empResponse = await http.get(
@@ -134,11 +140,43 @@ class _AdminHomeState extends State<AdminHome>
         debugPrint('Error loading departments: $e');
       }
 
+      // Load today's attendance count
+      try {
+        final todayResp = await http.get(
+          Uri.parse('$apiBaseUrl/attendance').replace(
+            queryParameters: {
+              'startDate': todayStr,
+              'endDate': todayStr,
+            },
+          ),
+          headers: {'Authorization': 'Bearer ${widget.token}'},
+        );
+        if (todayResp.statusCode == 200) {
+          final todayData = json.decode(todayResp.body);
+          if (todayData is Map && todayData['count'] is num) {
+            todayAttendanceCount = (todayData['count'] as num).toInt();
+          } else if (todayData is Map && todayData['data'] is List) {
+            todayAttendanceCount = (todayData['data'] as List).length;
+          }
+        }
+      } catch (e) {
+        debugPrint('Error loading today attendance: $e');
+      }
+
       if (!mounted) return;
       setState(() {
         _employees = employees;
         _devices = devices;
         _departments = departments;
+        _todayAttendanceCount = todayAttendanceCount;
+        final hasDeptFilter = _selectedDeptFilter != null && _selectedDeptFilter!.isNotEmpty;
+        if (hasDeptFilter) {
+          final stillExists = departments.any((d) => _extractDeptId(d) == _selectedDeptFilter);
+          if (!stillExists) {
+            _selectedDeptFilter = null;
+          }
+        }
+        _selectedAttendanceEmpId = _syncSelectedAttendanceEmployee(_filteredEmployeesByDept());
         _isLoading = false;
       });
     } catch (e) {
@@ -198,7 +236,7 @@ class _AdminHomeState extends State<AdminHome>
               Expanded(
                 child: _buildStatCard(
                   'Điểm danh hôm nay',
-                  '0',
+                  _todayAttendanceCount.toString(),
                   Icons.check_circle,
                   Colors.purple,
                 ),
@@ -533,6 +571,115 @@ class _AdminHomeState extends State<AdminHome>
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildAttendanceTab() {
+    final employees = _filteredEmployeesByDept();
+    final deptOptions = _buildDeptFilterOptions();
+    return RefreshIndicator(
+      onRefresh: _loadData,
+      child: ListView(
+        padding: const EdgeInsets.all(16),
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          const Text('Điểm danh nhân viên', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 12),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final isWide = constraints.maxWidth >= 600;
+              final double fieldWidth = isWide
+                  ? (constraints.maxWidth - 12) / 2
+                  : constraints.maxWidth;
+
+              return Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  SizedBox(
+                    width: fieldWidth,
+                    child: DropdownButtonFormField<String>(
+                      value: _selectedDeptFilter ?? '',
+                      items: deptOptions
+                          .map((d) => DropdownMenuItem(
+                                value: d['id'],
+                                child: Text(d['name'] ?? 'N/A'),
+                              ))
+                          .toList(),
+                      onChanged: (v) {
+                        setState(() {
+                          _selectedDeptFilter = v == '' ? null : v;
+                          _selectedAttendanceEmpId =
+                              _syncSelectedAttendanceEmployee(_filteredEmployeesByDept());
+                        });
+                      },
+                      decoration: const InputDecoration(
+                        labelText: 'Lọc theo phòng ban',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: fieldWidth,
+                    child: DropdownButtonFormField<String>(
+                      value: _selectedAttendanceEmpId,
+                      items: employees
+                          .map((e) => DropdownMenuItem(
+                                value: _extractEmployeeBusinessId(e),
+                                child: Text(
+                                  e['fullName']?.toString() ??
+                                      e['name']?.toString() ??
+                                      'N/A',
+                                ),
+                              ))
+                          .toList(),
+                      onChanged: (v) => setState(() => _selectedAttendanceEmpId = v),
+                      decoration: const InputDecoration(
+                        labelText: 'Chọn nhân viên',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              const Text('Chế độ'),
+              const SizedBox(width: 12),
+              ChoiceChip(
+                label: const Text('Check-in'),
+                selected: !_isCheckoutPhase,
+                onSelected: (_) => setState(() => _isCheckoutPhase = false),
+              ),
+              const SizedBox(width: 8),
+              ChoiceChip(
+                label: const Text('Check-out'),
+                selected: _isCheckoutPhase,
+                onSelected: (_) => setState(() => _isCheckoutPhase = true),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: _isSubmittingAttendance ? null : _submitAttendance,
+            icon: _isSubmittingAttendance
+                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : Icon(_isCheckoutPhase ? Icons.logout : Icons.login),
+            label: Text(_isCheckoutPhase ? 'Check-out' : 'Check-in'),
+            style: ElevatedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+          ),
+          if (_attendanceStatus != null) ...[
+            const SizedBox(height: 12),
+            Text(
+              _attendanceStatus!,
+              style: TextStyle(color: _attendanceStatusColor ?? Colors.green),
+            ),
+          ],
+        ],
+      ),
     );
   }
 
@@ -1451,6 +1598,173 @@ class _AdminHomeState extends State<AdminHome>
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text('Lỗi: $e')));
+      }
+    }
+  }
+
+  String _formatDate(DateTime dt) {
+    final y = dt.year.toString().padLeft(4, '0');
+    final m = dt.month.toString().padLeft(2, '0');
+    final d = dt.day.toString().padLeft(2, '0');
+    return '$y-$m-$d';
+  }
+
+  List<Map<String, String>> _buildDeptFilterOptions() {
+    final seen = <String>{};
+    final opts = <Map<String, String>>[
+      {'id': '', 'name': 'Tất cả phòng ban'},
+    ];
+    for (final dept in _departments) {
+      final id = _extractDeptId(dept);
+      if (id.isEmpty || !seen.add(id)) continue;
+      opts.add({'id': id, 'name': dept['name']?.toString() ?? id});
+    }
+    return opts;
+  }
+
+  List<Map<String, dynamic>> _filteredEmployeesByDept() {
+    final deptFilter = _selectedDeptFilter;
+    if (deptFilter == null || deptFilter.isEmpty) return _employees;
+    return _employees.where((e) {
+      final deptId = _extractDeptId(e['department']);
+      return deptId == deptFilter;
+    }).toList();
+  }
+
+  String _normalizeDeptId(dynamic value) {
+    final str = value?.toString() ?? '';
+    if (str.isEmpty || str.toLowerCase() == 'null') return '';
+    return str;
+  }
+
+  String _extractDeptId(dynamic dept) {
+    if (dept is Map) {
+      final dynamic id = dept['_id'] ?? dept['id'] ?? dept['departmentId'];
+      return _normalizeDeptId(id);
+    }
+    return _normalizeDeptId(dept);
+  }
+
+  String _extractEmployeeBusinessId(Map<String, dynamic> emp) {
+    final code = emp['code']?.toString();
+    if (code != null && code.isNotEmpty && code.toLowerCase() != 'null') return code;
+    final empId = emp['employeeId']?.toString();
+    if (empId != null && empId.isNotEmpty && empId.toLowerCase() != 'null') return empId;
+    final dbId = emp['_id']?.toString() ?? emp['id']?.toString();
+    return dbId ?? '';
+  }
+
+  String _extractEmployeeId(Map<String, dynamic> emp) {
+    final dbId = emp['_id']?.toString() ?? emp['id']?.toString();
+    if (dbId != null && dbId.isNotEmpty && dbId.toLowerCase() != 'null') return dbId;
+    final empId = emp['employeeId']?.toString();
+    if (empId != null && empId.isNotEmpty && empId.toLowerCase() != 'null') return empId;
+    final code = emp['code']?.toString();
+    if (code != null && code.isNotEmpty && code.toLowerCase() != 'null') return code;
+    return '';
+  }
+
+  String _extractEmployeeCode(Map<String, dynamic> emp) {
+    final code = emp['code']?.toString();
+    if (code != null && code.isNotEmpty && code.toLowerCase() != 'null') return code;
+    final empId = emp['employeeId']?.toString();
+    if (empId != null && empId.isNotEmpty && empId.toLowerCase() != 'null') return empId;
+    return '';
+  }
+
+  Map<String, dynamic>? _findEmployeeById(String id) {
+    for (final e in _employees) {
+      final business = _extractEmployeeBusinessId(e);
+      final db = _extractEmployeeId(e);
+      if (business == id || db == id) return e;
+    }
+    return null;
+  }
+
+  String? _syncSelectedAttendanceEmployee(List<Map<String, dynamic>> employees) {
+    final current = _selectedAttendanceEmpId;
+    final exists = current != null && employees.any((e) => _extractEmployeeBusinessId(e) == current);
+    if (exists) return current;
+    if (employees.isEmpty) return null;
+    return _extractEmployeeBusinessId(employees.first);
+  }
+
+  Future<void> _submitAttendance() async {
+    final empId = _selectedAttendanceEmpId;
+    if (empId == null || empId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Vui lòng chọn nhân viên')),
+      );
+      return;
+    }
+    setState(() {
+      _isSubmittingAttendance = true;
+      _attendanceStatus = null;
+    });
+    try {
+      final endpoint = _isCheckoutPhase ? 'check-out' : 'check-in';
+      final uri = Uri.parse('$apiBaseUrl/attendance/$endpoint');
+      final selectedEmp = _findEmployeeById(empId);
+      final empCode = selectedEmp != null ? _extractEmployeeCode(selectedEmp) : '';
+      final empObjectId = selectedEmp != null ? _extractEmployeeId(selectedEmp) : '';
+      final employeeIdPayload = empCode.isNotEmpty ? empCode : empId;
+      final payload = {
+        'employeeId': employeeIdPayload,
+        'method': 'manual',
+        if (empObjectId.isNotEmpty) 'employeeObjectId': empObjectId,
+        'managerId': _extractEmployeeId(widget.profile ?? {}),
+        if (empCode.isNotEmpty) 'employeeCode': empCode,
+        if (widget.profile?['code'] != null) 'managerCode': widget.profile?['code'],
+      };
+      final resp = await http.post(
+        uri,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${widget.token}',
+        },
+        body: jsonEncode(payload),
+      );
+
+      Map<String, dynamic>? body;
+      try {
+        final decoded = jsonDecode(resp.body);
+        if (decoded is Map<String, dynamic>) body = decoded;
+      } catch (_) {}
+
+      final success = resp.statusCode == 200 && (body?['success'] == true || body?['status'] == 'success');
+      if (success) {
+        setState(() {
+          _attendanceStatus = _isCheckoutPhase ? 'Đã check-out thành công' : 'Đã check-in thành công';
+          _attendanceStatusColor = Colors.green;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(_attendanceStatus!)),
+          );
+        }
+      } else {
+        String msg = body?['message']?.toString() ?? 'Điểm danh thất bại';
+        if (msg.toLowerCase().contains('not found') && empCode.isNotEmpty) {
+          msg = '$msg (đã gửi employeeId=$empCode)';
+        }
+        setState(() {
+          _attendanceStatus = msg;
+          _attendanceStatusColor = Colors.red;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(msg)),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Lỗi điểm danh: $e')));
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSubmittingAttendance = false);
       }
     }
   }
